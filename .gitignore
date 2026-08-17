@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenv
+backend/.venv/
+.venv/
+
+# Environment
+backend/.env
+
+# Uploads and runtime
+backend/uploads/
+.env
+node_modules/
+
+# Editor
+.vscode/
+.idea/
