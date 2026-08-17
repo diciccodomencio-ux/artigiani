@@ -5,7 +5,7 @@ services:
     plan: free
     rootDir: backend
     buildCommand: pip install -r requirements.txt
-    startCommand: python scripts/seed_staging_user.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    startCommand: python -m scripts.seed_staging_user && uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
