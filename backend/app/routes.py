@@ -501,7 +501,7 @@ def _download_meta_media(media_id: str) -> tuple[str | None, str | None]:
         return None, None
 
     # 3. Salva nella nostra cartella uploads
-    uploads_dir = Path(__file__).resolve().parent.parent / "uploads"
+    uploads_dir = settings.uploads_dir
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
     extension = ".jpg"
@@ -774,10 +774,10 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                             print("CAPTION:", caption)
 
                             if sender and media_id:
-                                return _process_whatsapp_inbound(
+                               return _process_whatsapp_inbound(
                                     db,
                                     f"whatsapp:{sender}",
-                                    caption,
+                                    caption or "[Foto WhatsApp]",
                                     1,
                                     None,
                                     channel="meta",
@@ -820,10 +820,15 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                             return _process_whatsapp_inbound(
                                 db,
                                 f"whatsapp:{sender}",
-                                text,
-                                0,
+                                caption or "[Foto WhatsApp]",
+                                1,
                                 None,
                                 channel="meta",
+                                meta_media={
+                                    "id": media_id,
+                                    "mime_type": mime_type,
+                                    "caption": caption,
+                                },
                             )
 
                     # ===== IMAGE =====
