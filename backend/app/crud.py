@@ -471,7 +471,10 @@ def assign_service_request(db: Session, service_request_id: int, assigned_user_i
     if not sr:
         return None
     sr.assigned_user_id = assigned_user_id
-    sr.status = models.RequestStatus.PROGRAMMATA
+    # Assegnare un tecnico non significa aver fissato un orario.
+    # PROGRAMMATA viene impostato solo da schedule_service_request().
+    if sr.status not in {models.RequestStatus.PROGRAMMATA, models.RequestStatus.IN_CORSO, models.RequestStatus.COMPLETATA}:
+        sr.status = models.RequestStatus.ACCETTATA
     db.commit()
     db.refresh(sr)
     return sr
