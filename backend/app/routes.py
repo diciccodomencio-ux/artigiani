@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from sqlalchemy.orm import Session
 from collections.abc import Generator
 from xml.sax.saxutils import escape as _xml_escape
+from datetime import date, datetime, time, timedelta
 
 from app import crud, schemas
 from app.database import SessionLocal
@@ -248,8 +249,178 @@ def dashboard_summary(db: Session = Depends(get_db), current_user: schemas.UserR
 
 
 @router.get("/appointments", response_model=list[schemas.AppointmentRead])
-def list_appointments(db: Session = Depends(get_db), current_user: schemas.UserRead = Depends(get_current_user)) -> list[schemas.AppointmentRead]:
-    return crud.get_appointments(db, business_id=current_user.business_id)
+def list_appointments(
+    day: date | None = Query(None),
+    assigned_user_id: int | None = Query(None),
+    include_completed: bool = Query(True),
+    db: Session = Depends(get_db),
+    current_user: schemas.UserRead = Depends(get_current_user),
+) -> list[schemas.AppointmentRead]:
+    start_datetime = None
+    end_datetime = None
+
+    if day is not None:
+        start_datetime = datetime.combine(day, time.min)
+        end_datetime = start_datetime + timedelta(days=1)
+
+    return crud.get_appointments(
+        db,
+        business_id=current_user.business_id,
+        start_datetime=start_datetime,
+        end_datetime=end_datetime,
+        assigned_user_id=assigned_user_id,
+        include_completed=include_completed,
+    )
+
+
+@router.get(
+    "/requests/{request_id}/duration-estimate",
+    response_model=schemas.DurationEstimateRead,
+)
+def get_duration_estimate(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: schemas.UserRead = Depends(get_current_user),
+) -> schemas.DurationEstimateRead:
+    sr = crud.get_service_request(db, request_id)
+    if not sr:
+        raise HTTPException(status_code=404, detail="ServiceRequest not found")
+    if sr.business_id != current_user.business_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    estimate = crud.estimate_service_request_duration(db, sr)
+
+    if sr.estimated_duration_minutes != estimate["estimated_duration_minutes"]:
+        crud.update_service_request(
+            db,
+            sr.id,
+            estimated_duration_minutes=estimate["estimated_duration_minutes"],
+        )
+
+    return estimate
+
+
+@router.put(
+    "/requests/{request_id}/location",
+    response_model=schemas.ServiceRequestRead,
+)
+def update_request_location(
+    request_id: int,
+    payload: schemas.ServiceRequestLocationUpdate,
+    db: Session = Depends(get_db),
+    current_user: schemas.UserRead = Depends(get_current_user),
+) -> schemas.ServiceRequestRead:
+    sr = crud.get_service_request(db, request_id)
+    if not sr:
+        raise HTTPException(status_code=404, detail="ServiceRequest not found")
+    if sr.business_id != current_user.business_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    if not (-90 <= payload.latitude <= 90):
+        raise HTTPException(status_code=400, detail="Invalid latitude")
+    if not (-180 <= payload.longitude <= 180):
+        raise HTTPException(status_code=400, detail="Invalid longitude")
+
+    updated = crud.update_service_request(
+        db,
+        request_id,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+    )
+    return updated
+
+
+@router.post(
+    "/requests/{request_id}/schedule",
+    response_model=schemas.AppointmentRead,
+)
+def schedule_request(
+    request_id: int,
+    payload: schemas.AppointmentCreate,
+    db: Session = Depends(get_db),
+    current_user: schemas.UserRead = Depends(get_current_user),
+) -> schemas.AppointmentRead:
+    sr = crud.get_service_request(db, request_id)
+    if not sr:
+        raise HTTPException(status_code=404, detail="ServiceRequest not found")
+    if sr.business_id != current_user.business_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    estimate = None
+    duration_minutes = payload.duration_minutes
+
+    if payload.end_datetime is None and duration_minutes is None:
+        estimate = crud.estimate_service_request_duration(db, sr)
+        duration_minutes = estimate["estimated_duration_minutes"]
+
+    if payload.end_datetime is not None:
+        end_datetime = payload.end_datetime
+    else:
+        duration_minutes = duration_minutes or 60
+        if duration_minutes <= 0:
+            raise HTTPException(status_code=400, detail="Duration must be positive")
+        end_datetime = payload.start_datetime + timedelta(minutes=duration_minutes)
+
+    if end_datetime <= payload.start_datetime:
+        raise HTTPException(status_code=400, detail="End time must be after start time")
+
+    normalized = payload.model_copy(
+        update={
+            "end_datetime": end_datetime,
+            "duration_minutes": duration_minutes,
+        }
+    )
+
+    if estimate is None:
+        estimated_minutes = max(
+            1,
+            round((end_datetime - payload.start_datetime).total_seconds() / 60),
+        )
+    else:
+        estimated_minutes = estimate["estimated_duration_minutes"]
+
+    crud.update_service_request(
+        db,
+        sr.id,
+        estimated_duration_minutes=estimated_minutes,
+    )
+    sr = crud.get_service_request(db, sr.id)
+
+    appointment = crud.schedule_service_request(db, sr, normalized)
+
+    start_label = payload.start_datetime.strftime("%d/%m/%Y alle %H:%M")
+    end_label = end_datetime.strftime("%H:%M")
+    _notify_request_customer(
+        db,
+        sr,
+        f"Intervento programmato per il {start_label}, fino alle {end_label}. "
+        "Se hai necessita di modificare l'orario rispondi a questo messaggio.",
+    )
+    return appointment
+
+
+@router.put(
+    "/appointments/{appointment_id}",
+    response_model=schemas.AppointmentRead,
+)
+def edit_appointment(
+    appointment_id: int,
+    payload: schemas.AppointmentUpdate,
+    db: Session = Depends(get_db),
+    current_user: schemas.UserRead = Depends(get_current_user),
+) -> schemas.AppointmentRead:
+    appointment = crud.get_appointment(db, appointment_id)
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    if appointment.business_id != current_user.business_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    try:
+        updated = crud.update_appointment(db, appointment_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return updated
 
 
 @router.get("/requests/{request_id}", response_model=schemas.ServiceRequestRead)
@@ -301,15 +472,42 @@ def assign_request(request_id: int, assigned_user_id: int, db: Session = Depends
     return updated
 
 
-@router.post("/requests/{request_id}/complete", response_model=schemas.ServiceRequestRead)
-def complete_request(request_id: int, db: Session = Depends(get_db), current_user: schemas.UserRead = Depends(get_current_user)) -> schemas.ServiceRequestRead:
-    sr = crud.complete_service_request(db, request_id)
+@router.post("/requests/{request_id}/start", response_model=schemas.ServiceRequestRead)
+def start_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: schemas.UserRead = Depends(get_current_user),
+) -> schemas.ServiceRequestRead:
+    sr = crud.get_service_request(db, request_id)
     if not sr:
         raise HTTPException(status_code=404, detail="ServiceRequest not found")
     if sr.business_id != current_user.business_id:
         raise HTTPException(status_code=403, detail="Not authorized")
-    _notify_request_customer(db, sr, "L'intervento risulta completato. Grazie per aver scelto ArtigianAI, se hai bisogno di altro puoi rispondere qui.")
-    return sr
+
+    updated = crud.start_service_request(db, request_id)
+    return updated
+
+
+@router.post("/requests/{request_id}/complete", response_model=schemas.ServiceRequestRead)
+def complete_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: schemas.UserRead = Depends(get_current_user),
+) -> schemas.ServiceRequestRead:
+    sr = crud.get_service_request(db, request_id)
+    if not sr:
+        raise HTTPException(status_code=404, detail="ServiceRequest not found")
+    if sr.business_id != current_user.business_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    updated = crud.complete_service_request(db, request_id)
+    _notify_request_customer(
+        db,
+        updated,
+        "L'intervento risulta completato. Grazie per aver scelto ArtigianAI, "
+        "se hai bisogno di altro puoi rispondere qui.",
+    )
+    return updated
 
 
 # --- Auth endpoints
@@ -774,7 +972,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                             print("CAPTION:", caption)
 
                             if sender and media_id:
-                               return _process_whatsapp_inbound(
+                                return _process_whatsapp_inbound(
                                     db,
                                     f"whatsapp:{sender}",
                                     caption or "[Foto WhatsApp]",
@@ -820,15 +1018,10 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                             return _process_whatsapp_inbound(
                                 db,
                                 f"whatsapp:{sender}",
-                                caption or "[Foto WhatsApp]",
-                                1,
+                                text,
+                                0,
                                 None,
                                 channel="meta",
-                                meta_media={
-                                    "id": media_id,
-                                    "mime_type": mime_type,
-                                    "caption": caption,
-                                },
                             )
 
                     # ===== IMAGE =====
@@ -848,7 +1041,7 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                             return _process_whatsapp_inbound(
                                 db,
                                 f"whatsapp:{sender}",
-                                caption,
+                                caption or "[Foto WhatsApp]",
                                 1,
                                 None,
                                 channel="meta",

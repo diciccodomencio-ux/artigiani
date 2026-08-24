@@ -141,6 +141,8 @@ class ServiceRequestRead(ORMModel):
     ai_summary: str | None = None
     ai_possible_cause: str | None = None
     estimated_duration_minutes: int | None = None
+    latitude: float | None = None
+    longitude: float | None = None
     estimated_price_min: float | None = None
     estimated_price_max: float | None = None
     preferred_date: datetime | None = None
@@ -151,6 +153,26 @@ class ServiceRequestRead(ORMModel):
     customer: CustomerSummary | None = None
 
 
+class AppointmentCreate(BaseModel):
+    start_datetime: datetime
+    end_datetime: datetime | None = None
+    duration_minutes: int | None = None
+    assigned_user_id: int | None = None
+    notes: str | None = None
+
+
+class AppointmentUpdate(BaseModel):
+    start_datetime: datetime | None = None
+    end_datetime: datetime | None = None
+    duration_minutes: int | None = None
+    assigned_user_id: int | None = None
+    status: str | None = None
+    customer_confirmed: bool | None = None
+    notes: str | None = None
+    route_order: int | None = None
+    travel_minutes: int | None = None
+
+
 class AppointmentRead(ORMModel):
     id: int
     business_id: int
@@ -159,10 +181,26 @@ class AppointmentRead(ORMModel):
     assigned_user_id: int | None = None
     start_datetime: datetime
     end_datetime: datetime
+    actual_start: datetime | None = None
+    actual_end: datetime | None = None
+    actual_duration_minutes: int | None = None
+    route_order: int | None = None
+    travel_minutes: int | None = None
     address: str | None = None
     status: str | None = None
     customer_confirmed: bool
     notes: str | None = None
+
+
+class DurationEstimateRead(BaseModel):
+    estimated_duration_minutes: int
+    sample_count: int
+    confidence: str
+
+
+class ServiceRequestLocationUpdate(BaseModel):
+    latitude: float
+    longitude: float
 
 
 class DashboardSummary(BaseModel):

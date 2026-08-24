@@ -1,4 +1,7 @@
 from sqlalchemy.orm import Session
+from datetime import datetime
+from difflib import SequenceMatcher
+import re
 
 from app import models, schemas
 
@@ -162,13 +165,232 @@ def create_service_request(db: Session, req: schemas.ServiceRequestCreate) -> mo
     return db_req
 
 
-def get_appointments(db: Session, business_id: int) -> list[models.Appointment]:
+def get_appointments(
+    db: Session,
+    business_id: int,
+    start_datetime: datetime | None = None,
+    end_datetime: datetime | None = None,
+    assigned_user_id: int | None = None,
+    include_completed: bool = True,
+) -> list[models.Appointment]:
+    q = db.query(models.Appointment).filter(models.Appointment.business_id == business_id)
+
+    if start_datetime is not None:
+        q = q.filter(models.Appointment.start_datetime >= start_datetime)
+
+    if end_datetime is not None:
+        q = q.filter(models.Appointment.start_datetime < end_datetime)
+
+    if assigned_user_id is not None:
+        q = q.filter(models.Appointment.assigned_user_id == assigned_user_id)
+
+    if not include_completed:
+        q = q.filter(models.Appointment.status != models.AppointmentStatus.COMPLETATO)
+
+    return q.order_by(models.Appointment.start_datetime.asc()).all()
+
+
+def get_appointment(db: Session, appointment_id: int) -> models.Appointment | None:
+    return db.query(models.Appointment).filter(models.Appointment.id == appointment_id).first()
+
+
+def get_appointment_by_service_request(
+    db: Session,
+    service_request_id: int,
+) -> models.Appointment | None:
     return (
         db.query(models.Appointment)
-        .filter(models.Appointment.business_id == business_id)
-        .order_by(models.Appointment.start_datetime.asc())
+        .filter(models.Appointment.service_request_id == service_request_id)
+        .order_by(models.Appointment.id.desc())
+        .first()
+    )
+
+
+def schedule_service_request(
+    db: Session,
+    service_request: models.ServiceRequest,
+    appointment: schemas.AppointmentCreate,
+) -> models.Appointment:
+    if appointment.end_datetime is None:
+        raise ValueError("end_datetime is required after schedule normalization")
+
+    existing = get_appointment_by_service_request(db, service_request.id)
+
+    assigned_user_id = (
+        appointment.assigned_user_id
+        if appointment.assigned_user_id is not None
+        else service_request.assigned_user_id
+    )
+
+    if existing:
+        existing.start_datetime = appointment.start_datetime
+        existing.end_datetime = appointment.end_datetime
+        existing.assigned_user_id = assigned_user_id
+        existing.address = service_request.address
+        existing.notes = appointment.notes
+        existing.status = models.AppointmentStatus.CONFERMATO
+        existing.customer_confirmed = True
+        db_appointment = existing
+    else:
+        db_appointment = models.Appointment(
+            business_id=service_request.business_id,
+            service_request_id=service_request.id,
+            customer_id=service_request.customer_id,
+            assigned_user_id=assigned_user_id,
+            start_datetime=appointment.start_datetime,
+            end_datetime=appointment.end_datetime,
+            address=service_request.address,
+            status=models.AppointmentStatus.CONFERMATO,
+            customer_confirmed=True,
+            notes=appointment.notes,
+        )
+        db.add(db_appointment)
+
+    service_request.status = models.RequestStatus.PROGRAMMATA
+    if assigned_user_id is not None:
+        service_request.assigned_user_id = assigned_user_id
+
+    duration_minutes = max(
+        1,
+        round((appointment.end_datetime - appointment.start_datetime).total_seconds() / 60),
+    )
+    if service_request.estimated_duration_minutes is None:
+        service_request.estimated_duration_minutes = duration_minutes
+
+    db.commit()
+    db.refresh(db_appointment)
+    db.refresh(service_request)
+    return db_appointment
+
+
+def update_appointment(
+    db: Session,
+    appointment_id: int,
+    payload: schemas.AppointmentUpdate,
+) -> models.Appointment | None:
+    appointment = get_appointment(db, appointment_id)
+    if not appointment:
+        return None
+
+    if payload.start_datetime is not None:
+        appointment.start_datetime = payload.start_datetime
+
+    if payload.end_datetime is not None:
+        appointment.end_datetime = payload.end_datetime
+    elif payload.duration_minutes is not None and payload.start_datetime is not None:
+        from datetime import timedelta
+        appointment.end_datetime = payload.start_datetime + timedelta(minutes=payload.duration_minutes)
+    elif payload.duration_minutes is not None:
+        from datetime import timedelta
+        appointment.end_datetime = appointment.start_datetime + timedelta(minutes=payload.duration_minutes)
+
+    if payload.assigned_user_id is not None:
+        appointment.assigned_user_id = payload.assigned_user_id
+
+    if payload.customer_confirmed is not None:
+        appointment.customer_confirmed = payload.customer_confirmed
+
+    if payload.notes is not None:
+        appointment.notes = payload.notes
+
+    if payload.route_order is not None:
+        appointment.route_order = payload.route_order
+
+    if payload.travel_minutes is not None:
+        appointment.travel_minutes = payload.travel_minutes
+
+    if payload.status is not None:
+        appointment.status = models.AppointmentStatus(payload.status)
+
+    if appointment.end_datetime <= appointment.start_datetime:
+        raise ValueError("end_datetime must be after start_datetime")
+
+    db.commit()
+    db.refresh(appointment)
+    return appointment
+
+
+def _normalize_problem_text(value: str | None) -> str:
+    text_value = (value or "").lower().strip()
+    return " ".join(re.findall(r"[a-zA-ZÀ-ÿ0-9]+", text_value))
+
+
+def estimate_service_request_duration(
+    db: Session,
+    service_request: models.ServiceRequest,
+    default_minutes: int = 60,
+    max_cases: int = 10,
+) -> dict:
+    target = _normalize_problem_text(
+        f"{service_request.category or ''} {service_request.description or ''}"
+    )
+
+    rows = (
+        db.query(models.ServiceRequest, models.Appointment)
+        .join(
+            models.Appointment,
+            models.Appointment.service_request_id == models.ServiceRequest.id,
+        )
+        .filter(
+            models.ServiceRequest.business_id == service_request.business_id,
+            models.ServiceRequest.id != service_request.id,
+            models.ServiceRequest.status == models.RequestStatus.COMPLETATA,
+            models.Appointment.actual_duration_minutes.isnot(None),
+            models.Appointment.actual_duration_minutes > 0,
+        )
         .all()
     )
+
+    scored: list[tuple[float, int]] = []
+    for candidate, appointment in rows:
+        candidate_text = _normalize_problem_text(
+            f"{candidate.category or ''} {candidate.description or ''}"
+        )
+        if not candidate_text:
+            continue
+
+        score = SequenceMatcher(None, target, candidate_text).ratio() if target else 0.0
+        if service_request.category and candidate.category:
+            if service_request.category.strip().lower() == candidate.category.strip().lower():
+                score = min(1.0, score + 0.15)
+
+        if score >= 0.20:
+            scored.append((score, int(appointment.actual_duration_minutes)))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = scored[:max_cases]
+
+    if not selected:
+        return {
+            "estimated_duration_minutes": default_minutes,
+            "sample_count": 0,
+            "confidence": "bassa",
+        }
+
+    weight_sum = sum(score for score, _ in selected)
+    if weight_sum <= 0:
+        estimate = default_minutes
+    else:
+        estimate = round(
+            sum(score * minutes for score, minutes in selected) / weight_sum
+        )
+
+    # Calendar-friendly slot: round to nearest 15 minutes, minimum 30.
+    estimate = max(30, min(480, int(round(estimate / 15.0) * 15)))
+
+    avg_score = sum(score for score, _ in selected) / len(selected)
+    if len(selected) >= 6 and avg_score >= 0.55:
+        confidence = "alta"
+    elif len(selected) >= 3 and avg_score >= 0.35:
+        confidence = "media"
+    else:
+        confidence = "bassa"
+
+    return {
+        "estimated_duration_minutes": estimate,
+        "sample_count": len(selected),
+        "confidence": confidence,
+    }
 
 
 def create_request_attachment(db: Session, service_request_id: int, file_url: str, file_type: str | None = None, caption: str | None = None) -> models.RequestAttachment:
@@ -216,39 +438,21 @@ def update_conversation(db: Session, conversation_id: int, **fields) -> models.C
     return conv
 
 
-def accept_service_request(db: Session, service_request_id: int, assigned_user_id: int | None = None) -> models.ServiceRequest | None:
+def accept_service_request(
+    db: Session,
+    service_request_id: int,
+    assigned_user_id: int | None = None,
+) -> models.ServiceRequest | None:
     sr = get_service_request(db, service_request_id)
     if not sr:
         return None
+
     sr.status = models.RequestStatus.ACCETTATA
     if assigned_user_id is not None:
         sr.assigned_user_id = assigned_user_id
+
     db.commit()
     db.refresh(sr)
-    # create a draft appointment when accepted (default: next day, 1h)
-    from datetime import datetime, timedelta
-    from app import models as _models
-
-    try:
-        start = datetime.utcnow() + timedelta(days=1)
-        end = start + timedelta(hours=1)
-        ap = _models.Appointment(
-            business_id=sr.business_id,
-            service_request_id=sr.id,
-            customer_id=sr.customer_id,
-            assigned_user_id=sr.assigned_user_id,
-            start_datetime=start,
-            end_datetime=end,
-            address=sr.address,
-            status=_models.AppointmentStatus.PROPOSTO,
-        )
-        db.add(ap)
-        db.commit()
-        db.refresh(ap)
-    except Exception:
-        # do not fail accept if appointment creation fails
-        pass
-
     return sr
 
 
@@ -273,13 +477,57 @@ def assign_service_request(db: Session, service_request_id: int, assigned_user_i
     return sr
 
 
-def complete_service_request(db: Session, service_request_id: int) -> models.ServiceRequest | None:
+def start_service_request(
+    db: Session,
+    service_request_id: int,
+) -> models.ServiceRequest | None:
     sr = get_service_request(db, service_request_id)
     if not sr:
         return None
-    sr.status = models.RequestStatus.COMPLETATA
+
+    sr.status = models.RequestStatus.IN_CORSO
+
+    appointment = get_appointment_by_service_request(db, service_request_id)
+    if appointment:
+        appointment.status = models.AppointmentStatus.IN_CORSO
+        if appointment.actual_start is None:
+            appointment.actual_start = datetime.utcnow()
+
     db.commit()
     db.refresh(sr)
+    if appointment:
+        db.refresh(appointment)
+    return sr
+
+
+def complete_service_request(
+    db: Session,
+    service_request_id: int,
+) -> models.ServiceRequest | None:
+    sr = get_service_request(db, service_request_id)
+    if not sr:
+        return None
+
+    sr.status = models.RequestStatus.COMPLETATA
+
+    appointment = get_appointment_by_service_request(db, service_request_id)
+    if appointment:
+        appointment.status = models.AppointmentStatus.COMPLETATO
+        appointment.actual_end = datetime.utcnow()
+
+        if appointment.actual_start is not None:
+            duration_seconds = (
+                appointment.actual_end - appointment.actual_start
+            ).total_seconds()
+            appointment.actual_duration_minutes = max(
+                1,
+                round(duration_seconds / 60),
+            )
+
+    db.commit()
+    db.refresh(sr)
+    if appointment:
+        db.refresh(appointment)
     return sr
 
 
