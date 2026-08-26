@@ -12,6 +12,7 @@ from fastapi.responses import PlainTextResponse, Response
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from app.security import create_access_token, decode_access_token
 from app.config import settings
+from app.storage import StorageError, store_media_bytes
 import requests as _requests
 from app import models
 
@@ -573,27 +574,42 @@ def refresh_token(req: schemas.RefreshRequest, db: Session = Depends(get_db)) ->
 
 # Attachments
 @router.post("/requests/{request_id}/attachments", response_model=schemas.RequestAttachmentRead)
-def upload_request_attachment(request_id: int, file: UploadFile = File(...), caption: str | None = Form(None), db: Session = Depends(get_db), current_user: schemas.UserRead = Depends(get_current_user)) -> schemas.RequestAttachmentRead:
-    # save file to uploads directory
-    from pathlib import Path
-    uploads_dir = settings.uploads_dir
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{int(__import__('time').time())}_{file.filename}"
-    dest = uploads_dir / filename
-    with dest.open("wb") as out:
-        import shutil
-        shutil.copyfileobj(file.file, out)
-
-    file_url = f"/uploads/{filename}"
-    # authorization: ensure the request belongs to the user's business
+def upload_request_attachment(
+    request_id: int,
+    file: UploadFile = File(...),
+    caption: str | None = Form(None),
+    db: Session = Depends(get_db),
+    current_user: schemas.UserRead = Depends(get_current_user),
+) -> schemas.RequestAttachmentRead:
+    # Authorize before writing anything to storage.
     sr = crud.get_service_request(db, request_id)
     if not sr:
         raise HTTPException(status_code=404, detail="ServiceRequest not found")
     if sr.business_id != current_user.business_id:
         raise HTTPException(status_code=403, detail="Not authorized to modify this request")
 
-    att = crud.create_request_attachment(db, service_request_id=request_id, file_url=file_url, file_type=file.content_type, caption=caption)
-    # serialize created_at to ISO string to avoid Pydantic/runtime mismatches
+    data = file.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty attachment")
+
+    try:
+        file_url = store_media_bytes(
+            data=data,
+            filename=file.filename or "attachment",
+            content_type=file.content_type,
+            folder=f"artigianai/requests/{request_id}",
+        )
+    except StorageError as exc:
+        raise HTTPException(status_code=502, detail=f"Media storage error: {exc}")
+
+    att = crud.create_request_attachment(
+        db,
+        service_request_id=request_id,
+        file_url=file_url,
+        file_type=file.content_type,
+        caption=caption,
+    )
+
     return {
         "id": att.id,
         "service_request_id": att.service_request_id,
@@ -698,21 +714,30 @@ def _download_meta_media(media_id: str) -> tuple[str | None, str | None]:
     if media_resp.status_code != 200:
         return None, None
 
-    # 3. Salva nella nostra cartella uploads
-    uploads_dir = settings.uploads_dir
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-
+    # 3. Salva su storage persistente (Cloudinary in staging/produzione).
     extension = ".jpg"
-
     if mime_type == "image/png":
         extension = ".png"
+    elif mime_type == "image/webp":
+        extension = ".webp"
+    elif mime_type == "video/mp4":
+        extension = ".mp4"
 
     filename = f"whatsapp_{int(time.time())}_{media_id}{extension}"
 
-    destination = uploads_dir / filename
-    destination.write_bytes(media_resp.content)
+    try:
+        persistent_url = store_media_bytes(
+            data=media_resp.content,
+            filename=filename,
+            content_type=mime_type,
+            folder="artigianai/whatsapp",
+        )
+    except StorageError as exc:
+        print("META MEDIA STORAGE ERROR:", repr(exc))
+        return None, None
 
-    return f"/uploads/{filename}", mime_type
+    print("META MEDIA STORED:", persistent_url)
+    return persistent_url, mime_type
 
 
 def _process_whatsapp_inbound(
