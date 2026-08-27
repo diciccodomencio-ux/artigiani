@@ -3,8 +3,6 @@ from sqlalchemy.orm import Session
 from collections.abc import Generator
 from xml.sax.saxutils import escape as _xml_escape
 from datetime import date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
-import re
 
 from app import crud, schemas
 from app.database import SessionLocal
@@ -28,8 +26,6 @@ WHATSAPP_STATUS_AWAITING_ADDRESS = "awaiting_address"
 WHATSAPP_STATUS_AWAITING_URGENCY = "awaiting_urgency"
 WHATSAPP_STATUS_AWAITING_MEDIA = "awaiting_media"
 WHATSAPP_STATUS_SUBMITTED = "submitted"
-WHATSAPP_STATUS_AWAITING_SCHEDULE_CONFIRMATION = "awaiting_schedule_confirmation"
-WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE = "awaiting_schedule_choice"
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -91,6 +87,90 @@ def _is_skip_media_message(text: str | None) -> bool:
         return False
     lowered = text.lower()
     return lowered in {"salta", "skip", "no", "nessuna foto", "nessun allegato"}
+
+
+def _whatsapp_command(text: str | None) -> str | None:
+    """Return one of NUOVA / ANNULLA / AIUTO for exact command-like messages."""
+    if not text:
+        return None
+
+    candidate = text.strip().upper()
+    if candidate.startswith("/"):
+        candidate = candidate[1:].strip()
+    candidate = candidate.rstrip(" .!?")
+
+    aliases = {
+        "NUOVA": "NUOVA",
+        "NUOVO": "NUOVA",
+        "NEW": "NUOVA",
+        "ANNULLA": "ANNULLA",
+        "CANCELLA": "ANNULLA",
+        "CANCEL": "ANNULLA",
+        "AIUTO": "AIUTO",
+        "HELP": "AIUTO",
+    }
+    return aliases.get(candidate)
+
+
+def _reset_whatsapp_conversation(
+    db: Session,
+    conversation: models.Conversation,
+    *,
+    status_value: str = WHATSAPP_STATUS_AWAITING_ISSUE,
+) -> models.Conversation:
+    """Detach the chat from the previous request and reset its intake stage.
+
+    crud.update_conversation intentionally ignores None values, so the detach
+    is done explicitly here.
+    """
+    conversation.service_request_id = None
+    conversation.status = status_value
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return conversation
+
+
+def _whatsapp_help_message(
+    stage: str,
+    service_request: models.ServiceRequest | None,
+) -> str:
+    status_label = (
+        _enum_value(service_request.status)
+        if service_request is not None
+        else None
+    )
+
+    stage_help = {
+        WHATSAPP_STATUS_AWAITING_ISSUE:
+            "Per continuare, descrivi in una frase il problema da risolvere.",
+        WHATSAPP_STATUS_AWAITING_CITY:
+            "Sto aspettando la citta dell'intervento.",
+        WHATSAPP_STATUS_AWAITING_ADDRESS:
+            "Sto aspettando l'indirizzo completo dell'intervento.",
+        WHATSAPP_STATUS_AWAITING_URGENCY:
+            "Sto aspettando l'urgenza: alta, media oppure bassa.",
+        WHATSAPP_STATUS_AWAITING_MEDIA:
+            "Puoi inviare una foto/video del problema oppure scrivere SALTA.",
+        WHATSAPP_STATUS_SUBMITTED:
+            (
+                f"La richiesta corrente e registrata"
+                + (f" con stato {status_label}." if status_label else ".")
+            ),
+    }
+
+    current_help = stage_help.get(
+        stage,
+        "Puoi continuare a scrivere qui per gestire la richiesta.",
+    )
+
+    return (
+        f"{current_help}\n\n"
+        "Comandi disponibili:\n"
+        "NUOVA - avvia una nuova richiesta\n"
+        "ANNULLA - annulla la richiesta corrente\n"
+        "AIUTO - mostra questo messaggio"
+    )
 
 
 def _build_attachment_url(file_url: str) -> str:
@@ -176,245 +256,18 @@ def _send_whatsapp_message(
         )
 
 
-def _notify_request_customer(
-    db: Session,
-    service_request: models.ServiceRequest | None,
-    body: str,
-    *,
-    conversation_status: str | None = None,
-) -> None:
+def _notify_request_customer(db: Session, service_request: models.ServiceRequest | None, body: str) -> None:
     if not service_request or not service_request.customer_id:
         return
-
     customer = crud.get_customer(db, service_request.customer_id)
     if not customer or not customer.phone:
         return
-
-    conversation = crud.get_conversation_by_customer_channel(
-        db,
-        service_request.business_id,
-        customer.id,
-        "whatsapp",
-    )
-
+    conversation = crud.get_conversation_by_customer_channel(db, service_request.business_id, customer.id, "whatsapp")
     if not conversation:
-        conversation = crud.create_conversation(
-            db,
-            service_request.business_id,
-            customer.id,
-            service_request.id,
-            "whatsapp",
-        )
-
-    update_fields: dict[str, object] = {}
-    if conversation.service_request_id != service_request.id:
-        update_fields["service_request_id"] = service_request.id
-    if conversation_status is not None:
-        update_fields["status"] = conversation_status
-
-    if update_fields:
-        conversation = crud.update_conversation(
-            db,
-            conversation.id,
-            **update_fields,
-        ) or conversation
-
+        conversation = crud.create_conversation(db, service_request.business_id, customer.id, service_request.id, "whatsapp")
+    if conversation.service_request_id is None:
+        conversation = crud.update_conversation(db, conversation.id, service_request_id=service_request.id) or conversation
     _send_whatsapp_message(db, conversation.id, customer.phone, body)
-
-
-def _rome_now_naive() -> datetime:
-    return datetime.now(ZoneInfo("Europe/Rome")).replace(tzinfo=None)
-
-
-def _format_slot(start_datetime: datetime, end_datetime: datetime) -> str:
-    weekday_names = [
-        "lunedi", "martedi", "mercoledi", "giovedi",
-        "venerdi", "sabato", "domenica",
-    ]
-    weekday = weekday_names[start_datetime.weekday()]
-    return (
-        f"{weekday} {start_datetime.strftime('%d/%m')} "
-        f"dalle {start_datetime.strftime('%H:%M')} "
-        f"alle {end_datetime.strftime('%H:%M')}"
-    )
-
-
-def _format_alternative_message(options: list[dict[str, datetime]]) -> str:
-    if not options:
-        return (
-            "Al momento non trovo automaticamente un altro slot libero. "
-            "Scrivi PROPONGO seguito da data e ora, per esempio: "
-            "PROPONGO 30/08 15:00."
-        )
-
-    lines = [
-        "Nessun problema. Posso proporti questi orari:",
-    ]
-    for index, option in enumerate(options, start=1):
-        lines.append(
-            f"{index}) {_format_slot(option['start_datetime'], option['end_datetime'])}"
-        )
-
-    lines.extend([
-        "",
-        "Rispondi 1, 2 oppure 3 per scegliere.",
-        "Oppure scrivi PROPONGO 30/08 15:00 con una tua preferenza.",
-    ])
-    return "\n".join(lines)
-
-
-def _normalize_schedule_reply(text: str | None) -> str:
-    return " ".join((text or "").strip().casefold().split())
-
-
-def _is_schedule_confirmation(text: str | None) -> bool:
-    normalized = _normalize_schedule_reply(text)
-    return normalized in {
-        "confermo", "confermato", "ok", "va bene",
-        "si", "sì", "perfetto",
-    }
-
-
-def _is_schedule_rejection(text: str | None) -> bool:
-    normalized = _normalize_schedule_reply(text)
-    rejection_tokens = (
-        "non disponibile",
-        "non posso",
-        "cambia",
-        "altro orario",
-        "altra data",
-        "no",
-    )
-    return normalized in rejection_tokens or any(
-        token in normalized for token in rejection_tokens[:-1]
-    )
-
-
-def _parse_customer_proposed_datetime(text: str | None) -> datetime | None:
-    if not text:
-        return None
-
-    normalized = (
-        text.strip()
-        .casefold()
-        .replace("alle", " ")
-        .replace("ore", " ")
-    )
-
-    now = _rome_now_naive()
-
-    relative_match = re.search(
-        r"\b(domani|dopodomani)\b.*?(\d{1,2})(?:[:.](\d{2}))?",
-        normalized,
-    )
-    if relative_match:
-        day_word = relative_match.group(1)
-        hour = int(relative_match.group(2))
-        minute = int(relative_match.group(3) or 0)
-        if hour > 23 or minute > 59:
-            return None
-        days = 1 if day_word == "domani" else 2
-        target = now + timedelta(days=days)
-        return target.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-    match = re.search(
-        r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?"
-        r"\s+(?:alle\s*)?(?:ore\s*)?(\d{1,2})(?:[:.](\d{2}))?",
-        normalized,
-    )
-    if not match:
-        return None
-
-    day = int(match.group(1))
-    month = int(match.group(2))
-    year_value = match.group(3)
-    hour = int(match.group(4))
-    minute = int(match.group(5) or 0)
-
-    if hour > 23 or minute > 59:
-        return None
-
-    if year_value:
-        year = int(year_value)
-        if year < 100:
-            year += 2000
-    else:
-        year = now.year
-
-    try:
-        candidate = datetime(year, month, day, hour, minute)
-    except ValueError:
-        return None
-
-    # If the customer omitted the year and the date is already well in the past,
-    # interpret it as the next calendar year.
-    if not year_value and candidate < now - timedelta(days=1):
-        try:
-            candidate = candidate.replace(year=year + 1)
-        except ValueError:
-            return None
-
-    return candidate
-
-
-def _appointment_duration_minutes(
-    db: Session,
-    service_request: models.ServiceRequest,
-    appointment: models.Appointment | None,
-) -> int:
-    if appointment and appointment.end_datetime > appointment.start_datetime:
-        return max(
-            30,
-            round(
-                (appointment.end_datetime - appointment.start_datetime).total_seconds()
-                / 60
-            ),
-        )
-
-    if service_request.estimated_duration_minutes:
-        return max(30, int(service_request.estimated_duration_minutes))
-
-    estimate = crud.estimate_service_request_duration(db, service_request)
-    return max(30, int(estimate["estimated_duration_minutes"]))
-
-
-def _generate_and_store_alternatives(
-    db: Session,
-    service_request: models.ServiceRequest,
-    appointment: models.Appointment,
-    *,
-    not_before: datetime | None = None,
-) -> list[dict[str, datetime]]:
-    now = _rome_now_naive()
-    duration_minutes = _appointment_duration_minutes(
-        db,
-        service_request,
-        appointment,
-    )
-
-    anchor = not_before or max(
-        now + timedelta(minutes=30),
-        appointment.start_datetime + timedelta(hours=2),
-    )
-
-    options = crud.find_alternative_slots(
-        db,
-        business_id=service_request.business_id,
-        duration_minutes=duration_minutes,
-        assigned_user_id=appointment.assigned_user_id,
-        exclude_appointment_id=appointment.id,
-        not_before=anchor,
-        excluded_starts=[appointment.start_datetime],
-        count=3,
-    )
-
-    crud.save_appointment_proposal_options(
-        db,
-        appointment,
-        options,
-        created_at=now,
-    )
-    return options
 
 
 
@@ -618,38 +471,15 @@ def schedule_request(
     )
     sr = crud.get_service_request(db, sr.id)
 
-    existing_appointment = crud.get_appointment_by_service_request(db, sr.id)
-    if not crud.is_appointment_slot_available(
-        db,
-        business_id=sr.business_id,
-        start_datetime=payload.start_datetime,
-        end_datetime=end_datetime,
-        assigned_user_id=(
-            payload.assigned_user_id
-            if payload.assigned_user_id is not None
-            else sr.assigned_user_id
-        ),
-        exclude_appointment_id=existing_appointment.id if existing_appointment else None,
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Lo slot selezionato si sovrappone a un altro impegno.",
-        )
-
     appointment = crud.schedule_service_request(db, sr, normalized)
 
-    slot_label = _format_slot(payload.start_datetime, end_datetime)
+    start_label = payload.start_datetime.strftime("%d/%m/%Y alle %H:%M")
+    end_label = end_datetime.strftime("%H:%M")
     _notify_request_customer(
         db,
         sr,
-        (
-            f"Ti proponiamo l'intervento {slot_label}.\n\n"
-            "Rispondi CONFERMO se va bene.\n"
-            "Se non sei disponibile scrivi NON DISPONIBILE e ti proporro "
-            "automaticamente altri 3 orari.\n"
-            "Puoi anche scrivere, per esempio: PROPONGO 30/08 15:00."
-        ),
-        conversation_status=WHATSAPP_STATUS_AWAITING_SCHEDULE_CONFIRMATION,
+        f"Intervento programmato per il {start_label}, fino alle {end_label}. "
+        "Se hai necessita di modificare l'orario rispondi a questo messaggio.",
     )
     return appointment
 
@@ -738,13 +568,6 @@ def start_request(
         raise HTTPException(status_code=404, detail="ServiceRequest not found")
     if sr.business_id != current_user.business_id:
         raise HTTPException(status_code=403, detail="Not authorized")
-
-    appointment = crud.get_appointment_by_service_request(db, request_id)
-    if appointment and not appointment.customer_confirmed:
-        raise HTTPException(
-            status_code=409,
-            detail="Il cliente non ha ancora confermato l'orario.",
-        )
 
     updated = crud.start_service_request(db, request_id)
     return updated
@@ -1070,6 +893,117 @@ def _process_whatsapp_inbound(
         stage = conv.status or _derive_whatsapp_stage(service_request)
         print(f"Stage: {stage}, SR: {service_request.id if service_request else 'NONE'}", file=sys.stderr)
 
+        command = _whatsapp_command(text)
+        if command:
+            print(f"WHATSAPP COMMAND: {command}", file=sys.stderr)
+
+        if command == "AIUTO":
+            return _reply(
+                stage,
+                _whatsapp_help_message(stage, service_request),
+            )
+
+        if command == "NUOVA":
+            previous_request_id = service_request.id if service_request else None
+            previous_status = (
+                _enum_value(service_request.status)
+                if service_request is not None
+                else None
+            )
+
+            conv = _reset_whatsapp_conversation(db, conv)
+
+            if previous_request_id is not None:
+                return _reply(
+                    WHATSAPP_STATUS_AWAITING_ISSUE,
+                    (
+                        f"Va bene. La richiesta #{previous_request_id} resta registrata"
+                        + (f" con stato {previous_status}." if previous_status else ".")
+                        + "\nOra descrivi in una frase il nuovo problema."
+                    ),
+                )
+
+            return _reply(
+                WHATSAPP_STATUS_AWAITING_ISSUE,
+                "Va bene. Descrivi in una frase il nuovo problema da risolvere.",
+            )
+
+        if command == "ANNULLA":
+            if service_request is None:
+                conv = _reset_whatsapp_conversation(db, conv)
+                return _reply(
+                    WHATSAPP_STATUS_AWAITING_ISSUE,
+                    "Non c'e una richiesta attiva da annullare. Se vuoi iniziarne una, descrivi il problema oppure scrivi NUOVA.",
+                )
+
+            current_status = _enum_value(service_request.status)
+            final_statuses = {
+                models.RequestStatus.COMPLETATA.value,
+                models.RequestStatus.RIFIUTATA.value,
+                models.RequestStatus.ANNULLATA.value,
+            }
+
+            if current_status == models.RequestStatus.IN_CORSO.value:
+                return _reply(
+                    stage,
+                    (
+                        f"La richiesta #{service_request.id} e gia IN_CORSO e non puo essere annullata automaticamente. "
+                        "Contatta direttamente l'artigiano per interrompere l'intervento."
+                    ),
+                )
+
+            if current_status in final_statuses:
+                request_id = service_request.id
+                conv = _reset_whatsapp_conversation(db, conv)
+                return _reply(
+                    WHATSAPP_STATUS_AWAITING_ISSUE,
+                    (
+                        f"La richiesta #{request_id} e gia nello stato {current_status} e non richiede annullamento. "
+                        "Per una nuova richiesta descrivi il problema oppure scrivi NUOVA."
+                    ),
+                )
+
+            request_id = service_request.id
+            crud.update_service_request(
+                db,
+                request_id,
+                status=models.RequestStatus.ANNULLATA,
+            )
+
+            # If the request had already been scheduled, remove the appointment
+            # from the active planner as well.
+            try:
+                appointment = crud.get_appointment_by_service_request(db, request_id)
+                if appointment:
+                    appointment_status = _enum_value(appointment.status)
+                    if appointment_status not in {
+                        models.AppointmentStatus.COMPLETATO.value,
+                        models.AppointmentStatus.ANNULLATO.value,
+                    }:
+                        crud.update_appointment(
+                            db,
+                            appointment.id,
+                            schemas.AppointmentUpdate(
+                                status=models.AppointmentStatus.ANNULLATO.value
+                            ),
+                        )
+            except Exception as exc:
+                # The cancellation of the service request must still succeed even
+                # if an old deployment has no planner helper available.
+                print(
+                    f"WARNING cancelling appointment for SR {request_id}: {repr(exc)}",
+                    file=sys.stderr,
+                )
+
+            conv = _reset_whatsapp_conversation(db, conv)
+            return _reply(
+                WHATSAPP_STATUS_AWAITING_ISSUE,
+                (
+                    f"Richiesta #{request_id} annullata. "
+                    "Se hai un altro problema, descrivilo qui oppure scrivi NUOVA."
+                ),
+            )
+
         if service_request is None and text:
             print("Creating new service request...", file=sys.stderr)
             service_request = crud.create_service_request(
@@ -1091,288 +1025,26 @@ def _process_whatsapp_inbound(
 
         if service_request is None:
             conv = crud.update_conversation(db, conv.id, status=WHATSAPP_STATUS_AWAITING_ISSUE)
-            reply_msg = "Ciao! Descrivimi in una frase il problema da risolvere e ti aiuto a creare la richiesta."
+            reply_msg = (
+                "Ciao! Descrivimi in una frase il problema da risolvere e ti aiuto a creare la richiesta. "
+                "In qualsiasi momento puoi scrivere AIUTO."
+            )
             print(f"Returning reply: {reply_msg}", file=sys.stderr)
             return _reply(WHATSAPP_STATUS_AWAITING_ISSUE, reply_msg)
 
         stage = conv.status or _derive_whatsapp_stage(service_request)
 
-        if stage in {
-            WHATSAPP_STATUS_AWAITING_SCHEDULE_CONFIRMATION,
-            WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-        }:
-            appointment = crud.get_appointment_by_service_request(
-                db,
-                service_request.id,
-            )
-
-            if not appointment:
-                conv = crud.update_conversation(
-                    db,
-                    conv.id,
-                    status=WHATSAPP_STATUS_SUBMITTED,
-                )
-                return _reply(
-                    WHATSAPP_STATUS_SUBMITTED,
-                    "Non trovo piu una proposta di appuntamento attiva. "
-                    "Il team ti ricontattera per fissare un nuovo orario.",
-                )
-
-            now = _rome_now_naive()
-            duration_minutes = _appointment_duration_minutes(
-                db,
-                service_request,
-                appointment,
-            )
-
-            proposed_start = _parse_customer_proposed_datetime(text)
-            if proposed_start is not None:
-                proposed_end = proposed_start + timedelta(minutes=duration_minutes)
-
-                if proposed_start <= now:
-                    return _reply(
-                        stage,
-                        "La data proposta deve essere futura. "
-                        "Scrivi per esempio: PROPONGO 30/08 15:00.",
-                    )
-
-                if crud.is_appointment_slot_available(
-                    db,
-                    business_id=service_request.business_id,
-                    start_datetime=proposed_start,
-                    end_datetime=proposed_end,
-                    assigned_user_id=appointment.assigned_user_id,
-                    exclude_appointment_id=appointment.id,
-                ):
-                    appointment = crud.confirm_appointment_slot(
-                        db,
-                        appointment=appointment,
-                        start_datetime=proposed_start,
-                        end_datetime=proposed_end,
-                    )
-                    conv = crud.update_conversation(
-                        db,
-                        conv.id,
-                        status=WHATSAPP_STATUS_SUBMITTED,
-                    )
-                    return _reply(
-                        WHATSAPP_STATUS_SUBMITTED,
-                        (
-                            "Perfetto, la tua proposta e disponibile. "
-                            f"Appuntamento confermato: "
-                            f"{_format_slot(appointment.start_datetime, appointment.end_datetime)}."
-                        ),
-                    )
-
-                options = _generate_and_store_alternatives(
-                    db,
-                    service_request,
-                    appointment,
-                    not_before=max(now + timedelta(minutes=30), proposed_start),
-                )
-                conv = crud.update_conversation(
-                    db,
-                    conv.id,
-                    status=WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                )
-                return _reply(
-                    WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                    (
-                        "L'orario che hai proposto non e disponibile.\n\n"
-                        + _format_alternative_message(options)
-                    ),
-                )
-
-            if stage == WHATSAPP_STATUS_AWAITING_SCHEDULE_CONFIRMATION:
-                if _is_schedule_confirmation(text):
-                    if crud.is_appointment_slot_available(
-                        db,
-                        business_id=service_request.business_id,
-                        start_datetime=appointment.start_datetime,
-                        end_datetime=appointment.end_datetime,
-                        assigned_user_id=appointment.assigned_user_id,
-                        exclude_appointment_id=appointment.id,
-                    ):
-                        appointment = crud.confirm_appointment_slot(
-                            db,
-                            appointment=appointment,
-                            start_datetime=appointment.start_datetime,
-                            end_datetime=appointment.end_datetime,
-                        )
-                        conv = crud.update_conversation(
-                            db,
-                            conv.id,
-                            status=WHATSAPP_STATUS_SUBMITTED,
-                        )
-                        return _reply(
-                            WHATSAPP_STATUS_SUBMITTED,
-                            (
-                                "Grazie, appuntamento confermato: "
-                                f"{_format_slot(appointment.start_datetime, appointment.end_datetime)}."
-                            ),
-                        )
-
-                    options = _generate_and_store_alternatives(
-                        db,
-                        service_request,
-                        appointment,
-                        not_before=now + timedelta(minutes=30),
-                    )
-                    conv = crud.update_conversation(
-                        db,
-                        conv.id,
-                        status=WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                    )
-                    return _reply(
-                        WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                        (
-                            "Nel frattempo quello slot non e piu disponibile.\n\n"
-                            + _format_alternative_message(options)
-                        ),
-                    )
-
-                if _is_schedule_rejection(text):
-                    options = _generate_and_store_alternatives(
-                        db,
-                        service_request,
-                        appointment,
-                    )
-                    conv = crud.update_conversation(
-                        db,
-                        conv.id,
-                        status=WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                    )
-                    return _reply(
-                        WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                        _format_alternative_message(options),
-                    )
-
-                return _reply(
-                    WHATSAPP_STATUS_AWAITING_SCHEDULE_CONFIRMATION,
-                    (
-                        "Per l'appuntamento puoi rispondere CONFERMO, "
-                        "NON DISPONIBILE oppure PROPONGO 30/08 15:00."
-                    ),
-                )
-
-            # Customer is choosing among automatically calculated alternatives.
-            normalized = _normalize_schedule_reply(text)
-            if normalized in {"1", "2", "3"}:
-                options = crud.get_appointment_proposal_options(
-                    appointment,
-                    now=now,
-                )
-
-                if not options:
-                    options = _generate_and_store_alternatives(
-                        db,
-                        service_request,
-                        appointment,
-                        not_before=now + timedelta(minutes=30),
-                    )
-                    return _reply(
-                        WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                        (
-                            "Le proposte precedenti sono scadute o non sono piu valide.\n\n"
-                            + _format_alternative_message(options)
-                        ),
-                    )
-
-                index = int(normalized) - 1
-                if index >= len(options):
-                    return _reply(
-                        WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                        "Quella opzione non e disponibile. Rispondi con uno dei numeri mostrati.",
-                    )
-
-                selected_option = options[index]
-                selected_start = selected_option["start_datetime"]
-                selected_end = selected_option["end_datetime"]
-
-                if not crud.is_appointment_slot_available(
-                    db,
-                    business_id=service_request.business_id,
-                    start_datetime=selected_start,
-                    end_datetime=selected_end,
-                    assigned_user_id=appointment.assigned_user_id,
-                    exclude_appointment_id=appointment.id,
-                ):
-                    options = _generate_and_store_alternatives(
-                        db,
-                        service_request,
-                        appointment,
-                        not_before=now + timedelta(minutes=30),
-                    )
-                    return _reply(
-                        WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                        (
-                            "Quello slot e stato appena occupato. "
-                            "Ti propongo queste nuove disponibilita:\n\n"
-                            + _format_alternative_message(options)
-                        ),
-                    )
-
-                appointment = crud.confirm_appointment_slot(
-                    db,
-                    appointment=appointment,
-                    start_datetime=selected_start,
-                    end_datetime=selected_end,
-                )
-                conv = crud.update_conversation(
-                    db,
-                    conv.id,
-                    status=WHATSAPP_STATUS_SUBMITTED,
-                )
-                return _reply(
-                    WHATSAPP_STATUS_SUBMITTED,
-                    (
-                        "Perfetto, appuntamento confermato: "
-                        f"{_format_slot(appointment.start_datetime, appointment.end_datetime)}."
-                    ),
-                )
-
-            if _is_schedule_rejection(text):
-                options = _generate_and_store_alternatives(
-                    db,
-                    service_request,
-                    appointment,
-                    not_before=now + timedelta(days=1),
-                )
-                return _reply(
-                    WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
-                    _format_alternative_message(options),
-                )
-
+        if stage == WHATSAPP_STATUS_SUBMITTED:
+            status_label = _enum_value(service_request.status) or models.RequestStatus.NUOVA.value
             return _reply(
-                WHATSAPP_STATUS_AWAITING_SCHEDULE_CHOICE,
+                WHATSAPP_STATUS_SUBMITTED,
                 (
-                    "Rispondi 1, 2 oppure 3 per scegliere uno degli orari proposti, "
-                    "oppure scrivi PROPONGO 30/08 15:00."
+                    f"La richiesta #{service_request.id} e gia registrata con stato {status_label}. "
+                    "Per aprire una nuova richiesta scrivi NUOVA. "
+                    "Per annullare quella corrente scrivi ANNULLA. "
+                    "Per vedere i comandi scrivi AIUTO."
                 ),
             )
-
-        if stage == WHATSAPP_STATUS_SUBMITTED:
-            if text:
-                service_request = crud.create_service_request(
-                    db,
-                    schemas.ServiceRequestCreate(
-                        customer_id=customer.id,
-                        source="whatsapp",
-                        category="Nuova richiesta",
-                        description=text,
-                        address=customer.address,
-                        city=customer.city,
-                        business_id=business_id,
-                    ),
-                )
-                conv = crud.update_conversation(
-                    db,
-                    conv.id,
-                    service_request_id=service_request.id,
-                    status=WHATSAPP_STATUS_AWAITING_CITY,
-                )
-                return _reply(WHATSAPP_STATUS_AWAITING_CITY, "Perfetto, apro una nuova richiesta. In quale citta si trova l'intervento?")
-            return _reply(WHATSAPP_STATUS_SUBMITTED, "Se vuoi aprire una nuova richiesta, descrivi in una frase il problema da risolvere.")
 
         if stage == WHATSAPP_STATUS_AWAITING_ISSUE and text:
             service_request = crud.update_service_request(db, service_request.id, description=text)
@@ -1452,7 +1124,14 @@ def _process_whatsapp_inbound(
                 if text not in combined_description:
                     joined = f"{combined_description}\n{text}".strip()
                     service_request = crud.update_service_request(db, service_request.id, description=joined)
-                return _reply(WHATSAPP_STATUS_AWAITING_MEDIA, "Ho aggiunto questa nota alla richiesta. Se hai foto o video inviali ora, oppure scrivi SALTA.")
+                return _reply(
+                    WHATSAPP_STATUS_AWAITING_MEDIA,
+                    (
+                        "Ho aggiunto questa nota alla richiesta. "
+                        "Se hai foto o video inviali ora, oppure scrivi SALTA. "
+                        "Se invece vuoi aprire un'altra richiesta, scrivi NUOVA."
+                    ),
+                )
 
         conv = crud.update_conversation(db, conv.id, status=WHATSAPP_STATUS_SUBMITTED)
         status_label = _enum_value(service_request.status) or models.RequestStatus.NUOVA.value
