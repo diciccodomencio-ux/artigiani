@@ -186,6 +186,8 @@ class AppointmentRead(ORMModel):
     actual_duration_minutes: int | None = None
     route_order: int | None = None
     travel_minutes: int | None = None
+    proposal_expires_at: datetime | None = None
+    proposal_round: int | None = None
     address: str | None = None
     status: str | None = None
     customer_confirmed: bool

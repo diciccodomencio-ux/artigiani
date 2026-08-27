@@ -1,7 +1,9 @@
 from sqlalchemy.orm import Session
-from datetime import datetime
+from sqlalchemy import or_
+from datetime import datetime, time, timedelta
 from difflib import SequenceMatcher
 import re
+import json
 
 from app import models, schemas
 
@@ -206,6 +208,231 @@ def get_appointment_by_service_request(
     )
 
 
+
+SCHEDULING_BUFFER_MINUTES = 20
+SCHEDULING_SLOT_STEP_MINUTES = 30
+SCHEDULING_PROPOSAL_TTL_HOURS = 48
+
+
+def _working_window(day_value: datetime) -> tuple[datetime, datetime] | None:
+    """Default beta working hours in local business time (Europe/Rome semantics)."""
+    weekday = day_value.weekday()
+    if weekday <= 4:  # Monday-Friday
+        start_t, end_t = time(8, 0), time(18, 0)
+    elif weekday == 5:  # Saturday
+        start_t, end_t = time(8, 30), time(13, 0)
+    else:
+        return None
+
+    return (
+        day_value.replace(hour=start_t.hour, minute=start_t.minute, second=0, microsecond=0),
+        day_value.replace(hour=end_t.hour, minute=end_t.minute, second=0, microsecond=0),
+    )
+
+
+def is_appointment_slot_available(
+    db: Session,
+    *,
+    business_id: int,
+    start_datetime: datetime,
+    end_datetime: datetime,
+    assigned_user_id: int | None = None,
+    exclude_appointment_id: int | None = None,
+    buffer_minutes: int = SCHEDULING_BUFFER_MINUTES,
+) -> bool:
+    if end_datetime <= start_datetime:
+        return False
+
+    window = _working_window(start_datetime)
+    if window is None:
+        return False
+
+    work_start, work_end = window
+    if start_datetime < work_start or end_datetime > work_end:
+        return False
+
+    buffered_start = start_datetime - timedelta(minutes=max(0, buffer_minutes))
+    buffered_end = end_datetime + timedelta(minutes=max(0, buffer_minutes))
+
+    q = (
+        db.query(models.Appointment)
+        .filter(
+            models.Appointment.business_id == business_id,
+            models.Appointment.status != models.AppointmentStatus.ANNULLATO,
+            models.Appointment.start_datetime < buffered_end,
+            models.Appointment.end_datetime > buffered_start,
+            or_(
+                models.Appointment.customer_confirmed.is_(True),
+                models.Appointment.proposal_options_json.is_(None),
+            ),
+        )
+    )
+
+    if exclude_appointment_id is not None:
+        q = q.filter(models.Appointment.id != exclude_appointment_id)
+
+    if assigned_user_id is not None:
+        q = q.filter(models.Appointment.assigned_user_id == assigned_user_id)
+
+    return q.first() is None
+
+
+def find_alternative_slots(
+    db: Session,
+    *,
+    business_id: int,
+    duration_minutes: int,
+    assigned_user_id: int | None = None,
+    exclude_appointment_id: int | None = None,
+    not_before: datetime,
+    excluded_starts: list[datetime] | None = None,
+    count: int = 3,
+    horizon_days: int = 14,
+) -> list[dict[str, datetime]]:
+    """Return up to count free slots, preferring different days."""
+    duration_minutes = max(30, min(480, int(duration_minutes or 60)))
+    excluded_starts = excluded_starts or []
+    excluded_keys = {
+        value.replace(second=0, microsecond=0).isoformat()
+        for value in excluded_starts
+    }
+
+    options: list[dict[str, datetime]] = []
+    current_day = not_before.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    for day_offset in range(horizon_days + 1):
+        day_value = current_day + timedelta(days=day_offset)
+        window = _working_window(day_value)
+        if window is None:
+            continue
+
+        work_start, work_end = window
+        cursor = work_start
+
+        if day_value.date() == not_before.date() and cursor < not_before:
+            minutes_from_midnight = not_before.hour * 60 + not_before.minute
+            step = SCHEDULING_SLOT_STEP_MINUTES
+            rounded_minutes = ((minutes_from_midnight + step - 1) // step) * step
+            cursor = day_value.replace(
+                hour=min(23, rounded_minutes // 60),
+                minute=rounded_minutes % 60 if rounded_minutes < 24 * 60 else 0,
+                second=0,
+                microsecond=0,
+            )
+            if rounded_minutes >= 24 * 60:
+                continue
+
+        # Prefer one option per day so the customer receives real date alternatives.
+        while cursor + timedelta(minutes=duration_minutes) <= work_end:
+            candidate_end = cursor + timedelta(minutes=duration_minutes)
+            candidate_key = cursor.replace(second=0, microsecond=0).isoformat()
+
+            if candidate_key not in excluded_keys and is_appointment_slot_available(
+                db,
+                business_id=business_id,
+                start_datetime=cursor,
+                end_datetime=candidate_end,
+                assigned_user_id=assigned_user_id,
+                exclude_appointment_id=exclude_appointment_id,
+            ):
+                options.append({
+                    "start_datetime": cursor,
+                    "end_datetime": candidate_end,
+                })
+                break
+
+            cursor += timedelta(minutes=SCHEDULING_SLOT_STEP_MINUTES)
+
+        if len(options) >= count:
+            break
+
+    return options
+
+
+def save_appointment_proposal_options(
+    db: Session,
+    appointment: models.Appointment,
+    options: list[dict[str, datetime]],
+    *,
+    created_at: datetime,
+) -> models.Appointment:
+    payload = [
+        {
+            "start_datetime": item["start_datetime"].isoformat(),
+            "end_datetime": item["end_datetime"].isoformat(),
+        }
+        for item in options
+    ]
+    appointment.proposal_options_json = json.dumps(payload)
+    appointment.proposal_expires_at = created_at + timedelta(hours=SCHEDULING_PROPOSAL_TTL_HOURS)
+    appointment.proposal_round = int(appointment.proposal_round or 0) + 1
+    appointment.status = models.AppointmentStatus.PROPOSTO
+    appointment.customer_confirmed = False
+    if options:
+        # Move the tentative calendar card to the first proposed alternative so
+        # the rejected time is immediately released from the planner.
+        appointment.start_datetime = options[0]["start_datetime"]
+        appointment.end_datetime = options[0]["end_datetime"]
+    db.commit()
+    db.refresh(appointment)
+    return appointment
+
+
+def get_appointment_proposal_options(
+    appointment: models.Appointment,
+    *,
+    now: datetime,
+) -> list[dict[str, datetime]]:
+    if not appointment.proposal_options_json:
+        return []
+
+    if appointment.proposal_expires_at and now > appointment.proposal_expires_at:
+        return []
+
+    try:
+        raw = json.loads(appointment.proposal_options_json)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+    options: list[dict[str, datetime]] = []
+    for item in raw:
+        try:
+            options.append({
+                "start_datetime": datetime.fromisoformat(item["start_datetime"]),
+                "end_datetime": datetime.fromisoformat(item["end_datetime"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return options
+
+
+def confirm_appointment_slot(
+    db: Session,
+    *,
+    appointment: models.Appointment,
+    start_datetime: datetime,
+    end_datetime: datetime,
+) -> models.Appointment:
+    appointment.start_datetime = start_datetime
+    appointment.end_datetime = end_datetime
+    appointment.status = models.AppointmentStatus.CONFERMATO
+    appointment.customer_confirmed = True
+    appointment.proposal_options_json = None
+    appointment.proposal_expires_at = None
+
+    service_request = None
+    if appointment.service_request_id is not None:
+        service_request = get_service_request(db, appointment.service_request_id)
+        if service_request:
+            service_request.status = models.RequestStatus.PROGRAMMATA
+
+    db.commit()
+    db.refresh(appointment)
+    if service_request:
+        db.refresh(service_request)
+    return appointment
+
+
 def schedule_service_request(
     db: Session,
     service_request: models.ServiceRequest,
@@ -228,8 +455,11 @@ def schedule_service_request(
         existing.assigned_user_id = assigned_user_id
         existing.address = service_request.address
         existing.notes = appointment.notes
-        existing.status = models.AppointmentStatus.CONFERMATO
-        existing.customer_confirmed = True
+        existing.status = models.AppointmentStatus.PROPOSTO
+        existing.customer_confirmed = False
+        existing.proposal_options_json = None
+        existing.proposal_expires_at = None
+        existing.proposal_round = 0
         db_appointment = existing
     else:
         db_appointment = models.Appointment(
@@ -240,8 +470,8 @@ def schedule_service_request(
             start_datetime=appointment.start_datetime,
             end_datetime=appointment.end_datetime,
             address=service_request.address,
-            status=models.AppointmentStatus.CONFERMATO,
-            customer_confirmed=True,
+            status=models.AppointmentStatus.PROPOSTO,
+            customer_confirmed=False,
             notes=appointment.notes,
         )
         db.add(db_appointment)
@@ -471,10 +701,7 @@ def assign_service_request(db: Session, service_request_id: int, assigned_user_i
     if not sr:
         return None
     sr.assigned_user_id = assigned_user_id
-    # Assegnare un tecnico non significa aver fissato un orario.
-    # PROGRAMMATA viene impostato solo da schedule_service_request().
-    if sr.status not in {models.RequestStatus.PROGRAMMATA, models.RequestStatus.IN_CORSO, models.RequestStatus.COMPLETATA}:
-        sr.status = models.RequestStatus.ACCETTATA
+    sr.status = models.RequestStatus.PROGRAMMATA
     db.commit()
     db.refresh(sr)
     return sr

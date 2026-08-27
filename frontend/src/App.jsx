@@ -268,18 +268,58 @@ function App() {
   const [routeSummary, setRouteSummary] = useState(null);
 
   useEffect(() => {
-    if (token) {
-      Promise.all([
-        fetchMe(),
+    if (!token) {
+      setPage('login');
+      return undefined;
+    }
+
+    let disposed = false;
+
+    const refreshLiveData = async () => {
+      const results = await Promise.allSettled([
         fetchDashboard(),
         fetchRequests(),
         fetchCustomers(),
-        fetchUsers(),
         fetchAppointments(),
-      ]).catch((err) => setError(err.message));
-    } else {
-      setPage('login');
-    }
+      ]);
+
+      if (disposed) return;
+
+      const rejected = results.find((result) => result.status === 'rejected');
+      if (rejected) {
+        setError(rejected.reason?.message || 'Errore durante l\'aggiornamento automatico');
+      } else {
+        setError('');
+      }
+    };
+
+    // Dati iniziali dell'utente e lista tecnici.
+    Promise.allSettled([
+      fetchMe(),
+      fetchUsers(),
+      refreshLiveData(),
+    ]);
+
+    // Beta: sincronizza automaticamente con le richieste arrivate da WhatsApp.
+    const intervalId = window.setInterval(refreshLiveData, 8000);
+
+    // Aggiorna immediatamente quando l'artigiano torna sulla scheda/app.
+    const handleFocus = () => refreshLiveData();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        refreshLiveData();
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, [token]);
 
   useEffect(() => {
@@ -431,6 +471,7 @@ function App() {
   async function fetchDashboard() {
     const res = await fetch(`${API_URL}/dashboard/summary`, {
       headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
     });
     if (!res.ok) throw new Error('Impossibile caricare la dashboard');
     setDashboard(await res.json());
@@ -463,6 +504,7 @@ function App() {
     try {
       const res = await fetch(`${API_URL}/requests`, {
         headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
       });
       if (!res.ok) throw new Error('Impossibile caricare le richieste');
       const data = await res.json();
@@ -481,6 +523,7 @@ function App() {
   async function fetchCustomers() {
     const res = await fetch(`${API_URL}/customers`, {
       headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
     });
     if (!res.ok) throw new Error('Impossibile caricare i clienti');
     setCustomers(await res.json());
@@ -489,6 +532,7 @@ function App() {
   async function fetchUsers() {
     const res = await fetch(`${API_URL}/users`, {
       headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
     });
     if (!res.ok) throw new Error('Impossibile caricare gli utenti');
     setUsers(await res.json());
@@ -497,6 +541,7 @@ function App() {
   async function fetchAppointments() {
     const res = await fetch(`${API_URL}/appointments`, {
       headers: { Authorization: `Bearer ${token}` },
+      cache: 'no-store',
     });
     if (!res.ok) throw new Error('Impossibile caricare il calendario');
     const data = await res.json();
@@ -697,7 +742,7 @@ function App() {
         start_datetime: scheduleStart,
         duration_minutes: duration,
         assigned_user_id: assigneeId ? Number(assigneeId) : selected?.assigned_user_id || null,
-        notes: 'Orario concordato con il cliente',
+        notes: 'Proposta appuntamento inviata al cliente via WhatsApp',
       };
 
       const res = await fetch(`${API_URL}/requests/${id}/schedule`, {
@@ -911,7 +956,7 @@ function App() {
   function renderAppointmentCard(appointment, compact = false) {
     const requestItem = requestForAppointment(appointment);
     const duration = minutesBetween(appointment.start_datetime, appointment.end_datetime);
-    const canStart = requestItem && requestItem.status === 'PROGRAMMATA';
+    const canStart = requestItem && requestItem.status === 'PROGRAMMATA' && appointment.customer_confirmed;
     const canComplete = requestItem && ['PROGRAMMATA', 'IN_CORSO'].includes(requestItem.status);
 
     return (
@@ -1183,7 +1228,7 @@ function App() {
                   <div className="section-heading">
                     <div>
                       <h3>Pianifica intervento</h3>
-                      <p>L'orario salvato viene comunicato al cliente e resta stabile finché non lo modifichi.</p>
+                      <p>L'orario viene inviato al cliente come proposta. Se non è disponibile, ArtigianAI calcola automaticamente 3 alternative libere.</p>
                     </div>
                     <Sparkles size={21} />
                   </div>
@@ -1221,14 +1266,14 @@ function App() {
                       <option value="">Tecnico non assegnato</option>
                       {users.map((user) => <option key={user.id} value={user.id}>{userLabel(user)} · {user.role}</option>)}
                     </select>
-                    <button className="schedule-action" onClick={() => scheduleRequest(selected.id)}><CalendarClock size={17} /> {currentAppointmentForRequest(selected.id) ? 'Aggiorna orario' : 'Conferma appuntamento'}</button>
+                    <button className="schedule-action" onClick={() => scheduleRequest(selected.id)}><CalendarClock size={17} /> {currentAppointmentForRequest(selected.id) ? 'Invia nuova proposta' : 'Invia proposta al cliente'}</button>
                   </div>
 
                   {currentAppointmentForRequest(selected.id) && (
                     <div className="confirmed-slot">
                       <CheckCircle2 size={18} />
                       <div>
-                        <strong>Orario confermato</strong>
+                        <strong>{currentAppointmentForRequest(selected.id).customer_confirmed ? 'Orario confermato dal cliente' : 'Proposta inviata · in attesa del cliente'}</strong>
                         <span>{formatDay(currentAppointmentForRequest(selected.id).start_datetime)} · {formatTime(currentAppointmentForRequest(selected.id).start_datetime)}–{formatTime(currentAppointmentForRequest(selected.id).end_datetime)}</span>
                       </div>
                     </div>
@@ -1261,7 +1306,7 @@ function App() {
                   <h3>Azioni intervento</h3>
                   <div className="request-action-bar planner-detail-actions">
                     {selected.status === 'NUOVA' && <button className="accept-action" onClick={() => acceptRequest(selected.id)}><Check size={18} /> Accetta</button>}
-                    {selected.status === 'PROGRAMMATA' && <button className="start-action" onClick={() => startRequest(selected.id)}><Play size={18} /> Inizia</button>}
+                    {selected.status === 'PROGRAMMATA' && currentAppointmentForRequest(selected.id)?.customer_confirmed && <button className="start-action" onClick={() => startRequest(selected.id)}><Play size={18} /> Inizia</button>}
                     {['PROGRAMMATA', 'IN_CORSO'].includes(selected.status) && <button className="complete-action" onClick={() => completeRequest(selected.id)}><CheckCircle2 size={18} /> Completa</button>}
                     {selectedCustomer?.phone ? <a className="call-action" href={`tel:${selectedCustomer.phone.replace(/\s/g, '')}`}><Phone size={18} /> Chiama</a> : null}
                     {selected.status === 'NUOVA' && <button className="reject-action" onClick={() => rejectRequest(selected.id)}><X size={18} /> Rifiuta</button>}

@@ -32,6 +32,18 @@ STATEMENTS = [
     ALTER TABLE appointments
     ADD COLUMN IF NOT EXISTS travel_minutes INTEGER
     """,
+    """
+    ALTER TABLE appointments
+    ADD COLUMN IF NOT EXISTS proposal_options_json TEXT
+    """,
+    """
+    ALTER TABLE appointments
+    ADD COLUMN IF NOT EXISTS proposal_expires_at TIMESTAMP
+    """,
+    """
+    ALTER TABLE appointments
+    ADD COLUMN IF NOT EXISTS proposal_round INTEGER DEFAULT 0
+    """,
 ]
 
 
@@ -40,7 +52,7 @@ def run() -> None:
         for statement in STATEMENTS:
             connection.execute(text(statement))
 
-    print("Planner v0.2 migration completed")
+    print("Planner migration completed (v0.2 + scheduling v0.4)")
 
 
 if __name__ == "__main__":
