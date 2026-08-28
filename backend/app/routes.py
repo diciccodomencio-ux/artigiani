@@ -767,6 +767,151 @@ def _send_appointment_buttons(
         )
 
 
+
+def _auto_create_first_proposal(
+    db: Session,
+    service_request: models.ServiceRequest,
+) -> object | None:
+    """Create and send the first proposal without artisan intervention.
+
+    The slot is selected from the existing agenda using:
+    - estimated intervention duration;
+    - currently occupied appointments;
+    - geographic position when latitude/longitude are already available.
+    """
+    existing = crud.get_appointment_by_service_request(db, service_request.id)
+    if existing is not None:
+        return existing
+
+    estimate = crud.estimate_service_request_duration(db, service_request)
+    duration_minutes = max(
+        1,
+        int(estimate.get("estimated_duration_minutes") or 60),
+    )
+
+    crud.update_service_request(
+        db,
+        service_request.id,
+        estimated_duration_minutes=duration_minutes,
+    )
+    service_request = crud.get_service_request(db, service_request.id)
+
+    # Use local-naive time because the existing planner/database currently
+    # stores appointment times in local wall-clock convention.
+    not_before = datetime.now(ITALY_TZ).replace(
+        tzinfo=None,
+        second=0,
+        microsecond=0,
+    )
+
+    best_slot = _best_automatic_slot(
+        db,
+        service_request,
+        duration_minutes,
+        not_before,
+        getattr(service_request, "assigned_user_id", None),
+    )
+    if best_slot is None:
+        print(
+            f"AUTO PLAN: no slot found for request {service_request.id}"
+        )
+        return None
+
+    automatic_start, automatic_end = best_slot
+
+    payload = schemas.AppointmentCreate(
+        start_datetime=automatic_start,
+        end_datetime=automatic_end,
+        duration_minutes=duration_minutes,
+        assigned_user_id=getattr(
+            service_request,
+            "assigned_user_id",
+            None,
+        ),
+        notes="Prima proposta generata automaticamente da ArtigianAI",
+    )
+
+    appointment = crud.schedule_service_request(
+        db,
+        service_request,
+        payload,
+    )
+
+    try:
+        appointment = crud.update_appointment(
+            db,
+            appointment.id,
+            schemas.AppointmentUpdate(
+                status=models.AppointmentStatus.PROPOSTO.value,
+                customer_confirmed=False,
+            ),
+        )
+    except Exception as exc:
+        print("AUTO PLAN appointment state warning:", repr(exc))
+
+    print(
+        "AUTO PLAN:",
+        f"request={service_request.id}",
+        f"appointment={appointment.id}",
+        f"start={appointment.start_datetime}",
+        f"end={appointment.end_datetime}",
+        f"duration={duration_minutes}",
+    )
+
+    _send_appointment_buttons(
+        db,
+        service_request,
+        appointment,
+    )
+    return appointment
+
+
+def _finish_intake_with_auto_proposal(
+    db: Session,
+    conversation: models.Conversation,
+    service_request: models.ServiceRequest,
+    channel: str,
+) -> Response:
+    """Finish intake and immediately let the planner propose the best slot."""
+    crud.update_conversation(
+        db,
+        conversation.id,
+        status=WHATSAPP_STATUS_SUBMITTED,
+    )
+
+    try:
+        appointment = _auto_create_first_proposal(
+            db,
+            service_request,
+        )
+    except Exception as exc:
+        print("AUTO PLAN ERROR:", repr(exc))
+        appointment = None
+
+    if appointment is not None:
+        # _send_appointment_buttons already sent the user-facing proposal.
+        return Response(status_code=200)
+
+    # Safe fallback: keep the request registered even when no automatic slot
+    # can be generated.
+    if channel == "meta":
+        _send_whatsapp_message(
+            db,
+            conversation.id,
+            crud.get_customer(db, service_request.customer_id).phone,
+            (
+                "✅ Richiesta registrata. Al momento non trovo uno slot "
+                "automatico disponibile; ti aggiorneremo appena possibile."
+            ),
+        )
+        return Response(status_code=200)
+
+    return _twilio_reply(
+        "Richiesta registrata. Al momento non trovo uno slot automatico disponibile."
+    )
+
+
+
 def _confirm_appointment(
     db: Session,
     appointment: object,
@@ -2038,17 +2183,11 @@ def _process_whatsapp_inbound(
                             caption=meta_media.get("caption") or "Foto WhatsApp",
                         )
 
-                        conv = crud.update_conversation(
+                        return _finish_intake_with_auto_proposal(
                             db,
-                            conv.id,
-                            status=WHATSAPP_STATUS_SUBMITTED,
-                        )
-
-                        return _reply(
-                            WHATSAPP_STATUS_SUBMITTED,
-                            "Perfetto \U0001F44D Ho ricevuto la foto. "
-                            "La richiesta è stata registrata e il team "
-                            "ti risponderà a breve."
+                            conv,
+                            service_request,
+                            channel,
                         )
 
             if media_count > 0 and form:
@@ -2063,12 +2202,20 @@ def _process_whatsapp_inbound(
                             file_type=media_type,
                             caption="Media WhatsApp",
                         )
-                conv = crud.update_conversation(db, conv.id, status=WHATSAPP_STATUS_SUBMITTED)
-                return _reply(WHATSAPP_STATUS_SUBMITTED, "Perfetto, ho ricevuto anche il materiale. La tua richiesta e stata registrata: ti aggiorneremo a breve su tempi e disponibilita.")
+                return _finish_intake_with_auto_proposal(
+                    db,
+                    conv,
+                    service_request,
+                    channel,
+                )
 
             if _is_skip_media_message(text):
-                conv = crud.update_conversation(db, conv.id, status=WHATSAPP_STATUS_SUBMITTED)
-                return _reply(WHATSAPP_STATUS_SUBMITTED, "Va bene, procedo senza allegati. La richiesta e stata registrata e il team ti rispondera a breve.")
+                return _finish_intake_with_auto_proposal(
+                    db,
+                    conv,
+                    service_request,
+                    channel,
+                )
 
             if text:
                 combined_description = (service_request.description or "").strip()
