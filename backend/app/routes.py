@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from collections.abc import Generator
 from xml.sax.saxutils import escape as _xml_escape
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from app import crud, schemas
 from app.database import SessionLocal
@@ -171,6 +172,113 @@ def _whatsapp_help_message(
         "ANNULLA - annulla la richiesta corrente\n"
         "AIUTO - mostra questo messaggio"
     )
+
+
+
+ITALY_TZ = ZoneInfo("Europe/Rome")
+
+def _italy_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(ITALY_TZ)
+
+def _send_whatsapp_interactive(db: Session, conversation_id: int, phone: str | None, body: str, interactive: dict) -> bool:
+    token = settings.meta_whatsapp_token
+    phone_number_id = settings.meta_phone_number_id
+    if not token or not phone_number_id or not phone:
+        print("META INTERACTIVE ERROR: configuration incomplete")
+        return False
+    normalized_phone = phone.replace("whatsapp:", "").replace("+", "").strip()
+    url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
+    payload = {"messaging_product":"whatsapp","recipient_type":"individual","to":normalized_phone,"type":"interactive","interactive":interactive}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        resp = _requests.post(url, json=payload, headers=headers, timeout=10)
+        print("META INTERACTIVE STATUS:", resp.status_code)
+        print("META INTERACTIVE RESPONSE:", resp.text)
+        if resp.status_code not in (200, 201):
+            return False
+        external_message_id = resp.json().get("messages", [{}])[0].get("id")
+        if conversation_id > 0:
+            crud.create_message(db, conversation_id=conversation_id, sender_type="business", message_type="interactive", content=body, external_message_id=external_message_id)
+        return True
+    except Exception as exc:
+        print("META INTERACTIVE EXCEPTION:", repr(exc))
+        return False
+
+def _send_appointment_buttons(db: Session, service_request: models.ServiceRequest, appointment: object) -> None:
+    customer = crud.get_customer(db, service_request.customer_id)
+    if not customer or not customer.phone:
+        return
+    conversation = crud.get_conversation_by_customer_channel(db, service_request.business_id, customer.id, "whatsapp")
+    if not conversation:
+        conversation = crud.create_conversation(db, service_request.business_id, customer.id, service_request.id, "whatsapp")
+    if conversation.service_request_id is None:
+        conversation = crud.update_conversation(db, conversation.id, service_request_id=service_request.id) or conversation
+    start_local = _italy_datetime(appointment.start_datetime)
+    end_local = _italy_datetime(appointment.end_datetime)
+    body = (
+        "🔧 Intervento proposto\n"
+        f"📅 {start_local.strftime('%d/%m/%Y')}\n"
+        f"🕒 {start_local.strftime('%H:%M')} – {end_local.strftime('%H:%M')}\n\n"
+        "Seleziona una delle opzioni:"
+    )
+    interactive = {
+        "type":"button",
+        "body":{"text":body},
+        "action":{"buttons":[
+            {"type":"reply","reply":{"id":f"appt_confirm:{appointment.id}","title":"Confermo"}},
+            {"type":"reply","reply":{"id":f"appt_alternatives:{appointment.id}","title":"Altri orari"}},
+            {"type":"reply","reply":{"id":f"appt_choose_day:{appointment.id}","title":"Propongo io"}},
+        ]}
+    }
+    if not _send_whatsapp_interactive(db, conversation.id, customer.phone, body, interactive):
+        _send_whatsapp_message(db, conversation.id, customer.phone, f"Intervento proposto per il {start_local.strftime('%d/%m/%Y alle %H:%M')}, fino alle {end_local.strftime('%H:%M')}. Rispondi CONFERMO se va bene oppure NON DISPONIBILE per cambiare orario.")
+
+def _extract_meta_interaction(message: dict) -> str | None:
+    if message.get("type") != "interactive":
+        return None
+    interactive = message.get("interactive", {})
+    if interactive.get("type") == "button_reply":
+        return interactive.get("button_reply", {}).get("id")
+    if interactive.get("type") == "list_reply":
+        return interactive.get("list_reply", {}).get("id")
+    return None
+
+def _handle_appointment_interaction(db: Session, sender: str | None, interaction_id: str) -> Response:
+    if not sender:
+        return Response(status_code=200)
+    phone = sender.replace("whatsapp:", "").replace("+", "").strip()
+    customer = crud.get_customer_by_phone(db, phone)
+    if not customer:
+        return Response(status_code=200)
+    conversation = crud.get_conversation_by_customer_channel(db, 1, customer.id, "whatsapp")
+    if not conversation:
+        return Response(status_code=200)
+    def reply(message: str) -> Response:
+        _send_whatsapp_message(db, conversation.id, customer.phone, message)
+        return Response(status_code=200)
+    try:
+        action, raw_id = interaction_id.split(":", 1)
+        appointment_id = int(raw_id)
+    except Exception:
+        return reply("Scelta non riconosciuta. Riprova dal messaggio dell'appuntamento.")
+    appointment = crud.get_appointment(db, appointment_id)
+    if not appointment:
+        return reply("Non trovo più questo appuntamento.")
+    if action == "appt_confirm":
+        try:
+            updated = crud.update_appointment(db, appointment.id, schemas.AppointmentUpdate(status=models.AppointmentStatus.CONFERMATO.value, customer_confirmed=True))
+        except Exception:
+            updated = crud.update_appointment(db, appointment.id, schemas.AppointmentUpdate(status=models.AppointmentStatus.CONFERMATO.value))
+        start_local = _italy_datetime(updated.start_datetime)
+        end_local = _italy_datetime(updated.end_datetime)
+        return reply(f"✅ Appuntamento confermato\n📅 {start_local.strftime('%d/%m/%Y')}\n🕒 {start_local.strftime('%H:%M')} – {end_local.strftime('%H:%M')}")
+    if action == "appt_alternatives":
+        return reply("🔄 Richiesta di cambio orario ricevuta. A breve ti proporremo gli orari disponibili.")
+    if action == "appt_choose_day":
+        return reply("📅 Indica il giorno e l'orario che preferisci, ad esempio: 30/08 15:00. Nella prossima versione questa scelta sarà disponibile direttamente da una lista.")
+    return reply("Scelta non riconosciuta.")
 
 
 def _build_attachment_url(file_url: str) -> str:
@@ -473,14 +581,8 @@ def schedule_request(
 
     appointment = crud.schedule_service_request(db, sr, normalized)
 
-    start_label = payload.start_datetime.strftime("%d/%m/%Y alle %H:%M")
-    end_label = end_datetime.strftime("%H:%M")
-    _notify_request_customer(
-        db,
-        sr,
-        f"Intervento programmato per il {start_label}, fino alle {end_label}. "
-        "Se hai necessita di modificare l'orario rispondi a questo messaggio.",
-    )
+    # WhatsApp Beta 1.0: native buttons + display in Europe/Rome.
+    _send_appointment_buttons(db, sr, appointment)
     return appointment
 
 
@@ -1163,6 +1265,11 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                         sender = message.get("from")
                         message_type = message.get("type")
 
+                        # ===== INTERACTIVE BUTTON / LIST =====
+                        interaction_id = _extract_meta_interaction(message)
+                        if sender and interaction_id:
+                            return _handle_appointment_interaction(db, f"whatsapp:{sender}", interaction_id)
+
                         # ===== TEXT =====
                         if message_type == "text":
                             text = message.get("text", {}).get("body")
@@ -1228,6 +1335,11 @@ async def meta_webhook(request: Request, db: Session = Depends(get_db)):
                 for message in value.get("messages", []):
                     sender = message.get("from")
                     message_type = message.get("type")
+
+                    # ===== INTERACTIVE BUTTON / LIST =====
+                    interaction_id = _extract_meta_interaction(message)
+                    if sender and interaction_id:
+                        return _handle_appointment_interaction(db, f"whatsapp:{sender}", interaction_id)
 
                     # ===== TEXT =====
                     if message_type == "text":
