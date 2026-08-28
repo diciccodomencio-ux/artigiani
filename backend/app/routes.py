@@ -1,3 +1,8 @@
+# ArtigianAI Release Candidate 1.0
+# Based on Beta 1.3 Auto Geolocation.
+# Functional scope frozen for RC testing: WhatsApp intake, media, automatic
+# geocoding, automatic first proposal, interactive booking and planner updates.
+
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form, Query
 from sqlalchemy.orm import Session
 from collections.abc import Generator
