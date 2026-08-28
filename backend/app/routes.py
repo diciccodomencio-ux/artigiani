@@ -235,6 +235,87 @@ def _appointment_duration(appointment: object) -> int:
     return 60
 
 
+
+def _geocode_service_request(
+    db: Session,
+    service_request: models.ServiceRequest,
+) -> models.ServiceRequest:
+    """Populate latitude/longitude from address+city when they are missing.
+
+    Uses OpenStreetMap Nominatim as a zero-config beta fallback.
+    If geocoding fails, the request is left unchanged and planning continues
+    using agenda + duration only.
+    """
+    if (
+        getattr(service_request, "latitude", None) is not None
+        and getattr(service_request, "longitude", None) is not None
+    ):
+        return service_request
+
+    address_parts = [
+        (getattr(service_request, "address", None) or "").strip(),
+        (getattr(service_request, "city", None) or "").strip(),
+        "Italia",
+    ]
+    query = ", ".join(part for part in address_parts if part)
+    if not query:
+        print(f"GEO: request={service_request.id} no address to geocode")
+        return service_request
+
+    try:
+        resp = _requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": query,
+                "format": "jsonv2",
+                "limit": 1,
+                "countrycodes": "it",
+            },
+            headers={
+                "User-Agent": "ArtigianAI-Beta/1.3 geocoder",
+                "Accept-Language": "it",
+            },
+            timeout=10,
+        )
+
+        print("GEO STATUS:", resp.status_code)
+        print("GEO QUERY:", query)
+
+        if resp.status_code != 200:
+            print("GEO ERROR RESPONSE:", resp.text[:500])
+            return service_request
+
+        results = resp.json()
+        if not results:
+            print(f"GEO: no result for request={service_request.id}")
+            return service_request
+
+        latitude = float(results[0]["lat"])
+        longitude = float(results[0]["lon"])
+
+        updated = crud.update_service_request(
+            db,
+            service_request.id,
+            latitude=latitude,
+            longitude=longitude,
+        )
+        print(
+            "GEO OK:",
+            f"request={service_request.id}",
+            f"lat={latitude}",
+            f"lon={longitude}",
+        )
+        return updated or service_request
+
+    except Exception as exc:
+        print(
+            f"GEO ERROR request={service_request.id}:",
+            repr(exc),
+        )
+        return service_request
+
+
+
 def _coords(service_request: object | None) -> tuple[float, float] | None:
     if service_request is None:
         return None
@@ -795,6 +876,13 @@ def _auto_create_first_proposal(
         estimated_duration_minutes=duration_minutes,
     )
     service_request = crud.get_service_request(db, service_request.id)
+
+    # Geolocate the textual address before scoring candidate slots.
+    # If geocoding fails, planning still continues using agenda + duration.
+    service_request = _geocode_service_request(
+        db,
+        service_request,
+    )
 
     # Use local-naive time because the existing planner/database currently
     # stores appointment times in local wall-clock convention.
